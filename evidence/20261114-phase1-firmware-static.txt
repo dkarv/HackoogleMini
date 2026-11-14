@@ -1,0 +1,111 @@
+Phase 1 — static hardening analysis of the 3.78.540761 firmware (target/ota-540761/)
+Date: 2026-11-14.  Tools: strings, readelf, nm, openssl, python3 (no Ghidra/binwalk in this env).
+Source tree: target/ota-540761/rootfs (SquashFS /system), ramdisk/ (boot ramdisk), work/vmlinux-3.78.elf.
+All reads are read-only; target/ is treated as untrusted input.
+NOTE: this is the SECOND Mini's build (3.78.540761), NOT the 3.75.468362 target. Carries over only where stated.
+
+================================================================================
+1a. CAST RECEIVER CHROME / V8 — version and CVE-2021-30563 patch provenance
+================================================================================
+Binary: rootfs/chrome/cast_shell — ELF 32-bit LSB PIE, ARM EABI5, stripped, BuildID 199b7e40...
+  Chrome/92.0.4515.0        <- note .0 = milestone-92 branch BASE, not a stable refresh
+  CrKey/3.78.540761
+  V8 version string in binary: 9.2.230   (M92 => V8 9.2.x, consistent)
+  WebRTC source stamp 2021-05-19T04:03:01   <- source-tree date of this build
+
+Reasoning:
+  - M92 (branch 4515) was branched ~2021-05; this build's source stamp is 2021-05-19.
+  - CVE-2021-30563 (V8 type confusion, in-the-wild 0-day, CVSS 8.8) was fixed 2021-07-15
+    in Chrome 91.0.4472.164 and carried forward into the 92 stable line (92.0.4515.107, 2021-07-20).
+  - A 4515.0 branch-BASE tree dated 2021-05-19 predates that fix by ~8 weeks.
+CONCLUSION: CVE-2021-30563 is almost certainly ABSENT (unpatched) in this V8, AND the build is
+  missing every V8/Chrome security fix after 2021-05-19 (Google froze Cast Chrome at 92.0.4515.0).
+LIMITATION: "almost certainly" = version-provenance argument. Definitive proof needs either a V8
+  patch-diff in the binary (Ghidra, not available here) or a live PoC (Phase 2b). Not asserting exploited.
+
+================================================================================
+1b. CAST "LAUNCH = arbitrary JS" PRIMITIVE — NOT confirmed; an app-support gate exists
+================================================================================
+cast_shell strings show an app allow/support model, not an open URL loader:
+  app_id / app_ids / android_appid
+  "App is supported: app_id="        "App is not supported per runtime type: app_id="
+  "App is not supported per specific runtime filters: app_id="
+  ALLOWLISTED_BY_POLICY   "Allowlisted secure origin pattern "
+  aogh_url_whitelist_for_whitelisted_agents / ..._for_non_whitelisted_agents
+CONCLUSION: the premise of README "Chain A" (unauth Cast LAUNCH loads our arbitrary probe.html)
+  is UNVERIFIED and likely gated by app_id support + allowlist/runtime filters.
+NEXT: decompile the LAUNCH / receiver-app handler (Ghidra) + live test on the 2nd Mini (Phase 2b).
+
+================================================================================
+1c. RENDERER SANDBOX — a V8 RCE is CONTAINED, not instant device takeover
+================================================================================
+rootfs/chrome/process.json (process launch config) contains sandbox-POSITIVE switches:
+  "--gpu-sandbox-failures-fatal=yes", "--no-unsandboxed-zygote",
+  {name:"gpu-sandbox-start-early"}, {name:"sandbox-thread-priority"}
+No "--no-sandbox" anywhere under rootfs/chrome, rootfs/etc, or ramdisk/.
+Kernel (work/vmlinux-3.78.elf) exports seccomp-bpf: seccomp_attach_filter, seccomp_attach_user_filter,
+  seccomp_bpf_load, seccomp_send_sigsys  => seccomp sandbox is available and used.
+No user_namespace / CONFIG_USER_NS symbols surfaced => unprivileged userns likely OFF.
+ramdisk/build.prop: ro.build.have_selinux=false  => NO SELinux (confirms F21).
+cast_shell / assistant run as uid "chrome" (F21/F32).
+CONCLUSION: a V8 renderer RCE (1a) yields code-exec in a seccomp-confined renderer as uid chrome,
+  NOT root and NOT an unconfined shell. Device takeover from there needs a 2nd-stage sandbox escape
+  or kernel LPE. (Tempers README's "V8 exploit -> SHELL".)
+
+================================================================================
+1d. TLS TRUST STORE & PINNING — on-path attacker can impersonate Google's backend  [BIGGEST FINDING]
+================================================================================
+rootfs/etc/ssl/certs/ca-certificates.crt:
+  README: "Generated from google3/security/cacerts/mozilla/... certificates publicly trusted as part
+           of the Mozilla Root Program ... suitable for clients that want to validate HTTPS chains."
+  128 distinct root CAs (the full public Mozilla set).
+  eMudhra roots PRESENT (the "leaked emudhra CA" used in R1 chains to one of these):
+    C=IN, OU=emSign PKI, O=eMudhra Technologies Limited, CN=emSign ECC Root CA - G3
+    C=IN, OU=emSign PKI, O=eMudhra Technologies Limited, CN=emSign Root CA - G1
+    C=US, OU=emSign PKI, O=eMudhra Inc,  CN=emSign ECC Root CA - C3
+    C=US, OU=emSign PKI, O=eMudhra Inc,  CN=emSign Root CA - C1
+  ...plus Amazon, DigiCert, Comodo, Actalis, China Financial CA, ACCV, Buypass, etc.
+Pinning: cast_shell carries only the generic Chromium TransportSecurityState machinery
+  (public-key-pins, static_pkp_*, dynamic_pkp_*) and logs "no TransportSecurityState active".
+  EMPIRICAL (R1, notes/mitm-capture.md): *.googleapis.com and tools.google.com were fully
+  intercepted with the emudhra leaf => NO effective server-cert pinning on those channels.
+  Exception: lycraservice-pa (device mTLS) was NOT interceptable.
+CONCLUSION: the device validates its cloud channels (incl. the Assistant/S3 voice channel) against
+  128 public CAs with no effective pinning. Any cert from any trusted public CA — or a key
+  compromise / mis-issuance like the emudhra leak — lets an on-path attacker (DNS/ARP/upstream)
+  MITM the device. Per R4 the Assistant S3 stream carries client-ops (tts.OUTPUT, device.UPDATE_VOLUME,
+  bluetooth.*, led.*, device.MODIFY_SETTING), so this is remote COMMAND of the device WITHOUT root (tier T2).
+  Blockers to weaponizing: the S3 schema is undocumented (tag numbers only) and the stream is driven
+  by the device's own per-user OAuth tokens. Demonstrated reachability, not yet a full injection PoC.
+
+================================================================================
+1e. ROOT NETWORK DAEMONS — versions (all run as root) + reachability
+================================================================================
+Confirmed from the binaries (rootfs/bin):
+  dnsmasq           2.78
+  wpa_supplicant    v2.6-devel-3.78   (Google fork of upstream 2.6)
+  hostapd           v2.6-devel-3.78
+  dhcpcd            6.8.2
+init.rc capability grants exist for networking services (NET_RAW NET_ADMIN, NET_ADMIN).
+Reachability by role:
+  - wpa_supplicant: parses mgmt/EAPOL frames from whatever AP the Mini associates to => a rogue AP
+    (after an 802.11 deauth) reaches these parsers. Upstream 2.6 is pre-KRACK-fix base
+    (CVE-2017-13077.., CVE-2018-14526, P2P CVE-2021-0326); backport status of the -devel-3.78 fork UNKNOWN.
+  - hostapd: reachable from stations only when the Mini is an AP (setup hotspot / group owner).
+  - dnsmasq 2.78: DNS/DHCP for AP clients; < 2.83 => DNSpooq class (CVE-2020-25681..25687, incl. heap
+    overflow / cache poisoning). (2.78 already contains the 2017 CVE-2017-1449x fixes.)
+  - dhcpcd 6.8.2 (~2015): root process parsing attacker-controlled DHCP responses from the LAN.
+LIMITATION: exact CVE applicability depends on Google's backports into the -3.78 fork; needs a
+  per-CVE cross-check (symbol/patch level), not just the version string. Versions here are verified.
+
+================================================================================
+SUMMARY / register impact
+================================================================================
+#1 Chrome n-day  : version plausibly vulnerable (CONFIRMED provenance) BUT renderer is sandboxed (1c)
+                   and LAUNCH reachability is gated (1b) => "RCE->shell" is NOT established. Needs chain.
+#2 S3 / TLS MITM : mechanism CONFIRMED (Mozilla 128-root store incl. emudhra, no pinning) + empirical (R1).
+                   Strongest remote finding: command the device on-path without root. => promote.
+#3 Root daemons  : versions CONFIRMED (dnsmasq 2.78, wpa/hostapd 2.6, dhcpcd 6.8.2), all root; CVE
+                   cross-ref pending.
+Applies to 3.78.540761 (2nd Mini). The 3.75.468362 target's own Chrome/kernel/daemon versions are
+still unmeasured and may differ.

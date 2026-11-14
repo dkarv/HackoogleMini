@@ -1360,3 +1360,73 @@ It then runs "Failed to validate static params in config string", which suggests
 are static after the first parse. `s3_grpc_server_uri` is **not** in the explicit
 override list, so it is probably fixed by the on-disk JSON unless `SetConfigString`
 replaces the whole string (unknown).
+
+---
+
+## Phase 1 — firmware-static hardening pass (2026-11-14)
+
+Reframed from "replace the agent" to a **device-takeover surface register** (defensive lens):
+each item is marked *verified* vs *assumed*. Static analysis of `target/ota-540761/` — the
+**3.78.540761 second-Mini build, not the 3.75.468362 target** (carries over only where noted).
+Evidence: `evidence/20261114-phase1-firmware-static.txt`. Tools: strings/readelf/nm/openssl/python3
+(no Ghidra/binwalk in this environment, so code-level decompiles are deferred).
+
+### F33. Cast Chrome/V8 is frozen at the M92 branch base (2021-05-19) — CVE-2021-30563 window
+
+`rootfs/chrome/cast_shell`: **Chrome/92.0.4515.0**, **V8 9.2.230**, **WebRTC source stamp
+2021-05-19T04:03:01**. The `.0` is the milestone-92 *branch base*, not a stable refresh. CVE-2021-30563
+(V8 type confusion, in-the-wild 0-day, CVSS 8.8) was fixed 2021-07-15 in 91.0.4472.164 and carried into
+92 stable (92.0.4515.107, 2021-07-20). A branch-base tree dated 2021-05-19 predates the fix by ~8 weeks,
+so the fix is almost certainly **absent** — and the build lacks *every* V8/Chrome fix after 2021-05-19
+(Google froze Cast Chrome at 92.0.4515.0). **Conclusion:** plausibly vulnerable by provenance.
+**Limitation:** not proven — needs a V8 patch-diff (Ghidra) or a live PoC (Phase 2b); not claiming
+exploited. Upgrades the README "UNPATCHED" badge from an assertion to a supported inference.
+
+### F34. The "unauth Cast LAUNCH runs our arbitrary JS" premise (README Chain A) is unverified
+
+cast_shell enforces an app-support/allowlist model, not an open URL loader: `app_id`, `app_ids`,
+`"App is supported: app_id="`, `"App is not supported per runtime type:"`, `"…per specific runtime
+filters:"`, `ALLOWLISTED_BY_POLICY`, `aogh_url_whitelist_for_{,non_}whitelisted_agents`. Loading an
+arbitrary attacker receiver URL is therefore likely **gated**. The whole Chain A delivery step must be
+validated (decompile the LAUNCH handler + live test on the 2nd Mini, Phase 2b), not assumed.
+
+### F35. The renderer is sandboxed — a V8 RCE is contained, not instant takeover
+
+`rootfs/chrome/process.json` carries sandbox-**positive** switches (`--gpu-sandbox-failures-fatal=yes`,
+`--no-unsandboxed-zygote`, `gpu-sandbox-start-early`) and **no `--no-sandbox`** exists anywhere under
+chrome/etc/ramdisk. The 3.8.13 kernel exports seccomp-bpf (`seccomp_attach_filter`,
+`seccomp_attach_user_filter`, `seccomp_bpf_load`); unprivileged userns appears **off**; SELinux is
+**off** (`ro.build.have_selinux=false`, F21); cast_shell runs as uid `chrome`. **Conclusion:** a renderer
+RCE (F33) lands seccomp-confined as uid chrome — device takeover needs a 2nd-stage sandbox escape or
+kernel LPE. Tempers the README's "V8 exploit → SHELL".
+
+### F36. Device trusts 128 public CAs (incl. eMudhra) with no pinning on its cloud channels — **key finding**
+
+`rootfs/etc/ssl/certs/ca-certificates.crt` is the **full Mozilla root program** (128 roots; README:
+"Generated from google3/security/cacerts/mozilla/"), and it **includes the eMudhra/emSign roots**
+(emSign ECC/RSA Root CA G1/G3/C1/C3) — the family whose leaked key drove R1. cast_shell has only the
+generic Chromium pinning machinery and logs "no TransportSecurityState active"; R1 empirically
+intercepted `*.googleapis.com` + `tools.google.com` with the emudhra leaf. **Conclusion:** the
+Assistant/S3 voice channel (and update/most Google channels) are validated against 128 public CAs with
+**no effective server-cert pinning**. Any publicly-trusted cert — or a CA key compromise/mis-issuance
+like emudhra — lets an on-path attacker (DNS/ARP/upstream) MITM the device and, per R4, inject Assistant
+client-ops (`tts.OUTPUT`, `device.UPDATE_VOLUME`, `bluetooth.*`, `device.MODIFY_SETTING`) = **remote
+command of the device without root (tier T2)**. Exception: `lycraservice-pa` uses device mTLS and
+resisted (R1). **Blockers to a full PoC:** undocumented S3 schema + the stream is driven by the device's
+own OAuth tokens. Strongest remote finding; mitigation is owner-side (segment/limit the Mini's egress)
+because the trust-store decision is Google's.
+
+### F37. Root LAN/RF daemons — versions verified, all run as root
+
+From the binaries (`rootfs/bin`): **dnsmasq 2.78**, **wpa_supplicant v2.6-devel-3.78**, **hostapd
+v2.6-devel-3.78**, **dhcpcd 6.8.2** (confirms F21). Reachability: wpa_supplicant parses mgmt/EAPOL frames
+from any AP the Mini joins (a rogue AP after an 802.11 deauth reaches a root parser); hostapd only in
+AP/setup-hotspot mode; dnsmasq 2.78 (< 2.83 → DNSpooq CVE-2020-25681..687 class) and dhcpcd 6.8.2 when
+serving or parsing DHCP. **Limitation:** exact CVE applicability depends on Google's backports into the
+`-3.78` fork; needs a per-CVE cross-check, not just the version string. Versions are verified; CVE
+cross-ref is the next step.
+
+**Phase 1 residue (gating):** the cast_shell LAUNCH-handler decompile (F34) and a V8 patch-diff (F33)
+both need Ghidra (absent in this env; the copied `work/ghidra/` projects cover libhvc/assistant/
+ml_framework, not cast_shell). Every 3.75-target-vs-3.78 version delta remains open — the target is still
+unmeasured on its own Chrome/kernel/daemon versions.
