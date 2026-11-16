@@ -1430,3 +1430,185 @@ cross-ref is the next step.
 both need Ghidra (absent in this env; the copied `work/ghidra/` projects cover libhvc/assistant/
 ml_framework, not cast_shell). Every 3.75-target-vs-3.78 version delta remains open — the target is still
 unmeasured on its own Chrome/kernel/daemon versions.
+
+### F38. YAFFS2 scan path is present and structurally vulnerable-shaped in the *current* (3.78) kernel
+
+Firmware analysis toward Piste 2, done in a podman sandbox (official `debian:12-slim` +
+`binutils-arm-linux-gnueabi`; firmware mounted read-only). Target: `work/vmlinux-3.78.elf`
+(non-stripped ARM ELF). Evidence (trimmed excerpts — these are decompiler/objdump output
+derived from Google's copyrighted binary, so only the cited sections are checked in;
+regenerate the full output from your own OTA per `evidence/README-yaffs-decompiles.md`):
+`evidence/20261114-yaffs2_scan_backwards.disasm`, `evidence/20261114-yaffs-decomp.c`,
+`evidence/20261114-yaffs-retype.c`.
+
+- **Kernel build:** `Linux version 3.8.13+ ... Fri Sep 20 22:55:27 2024` with YAFFS2 compiled
+  in (`Multi-version YAFFS`). So the *current stable* build (3.78.540761, the second Mini) still
+  ships the same ~2012-era yaffs2 code base — Google has not rebased off it. The target's
+  3.75.468362 is older, so no less exposed.
+- **The scan function exists and matches the vulnerable shape.** `yaffs2_scan_backwards`
+  (`0xc0293bcc`–`0xc0294bfc`, 0x1030 B) calls `yaffs_find_or_create_by_number` ×5; the
+  data-chunk path (site `0xc029436c`) passes `r2=#3` (`YAFFS_OBJECT_TYPE_FILE`) **hardcoded**,
+  then immediately consumes the returned object (`yaffs_oh_to_size`, field stores) — the exact
+  pattern courk's object-confusion primitive abuses (a data chunk whose `obj_id` names an object
+  created as a different variant type → union overlap → controlled write).
+
+**What this does NOT establish (limitations, do not overstate):**
+- Whether the specific upstream guard is *absent* is **not proven** from raw ARM alone — it needs
+  a decompile + `yaffs_obj` struct-offset reconstruction (the `[obj,#100]`/`cmp #1` checks at
+  sites `0xc0294558` and `0xc0294a3c` may or may not be the relevant type check). Next analytical
+  step; still only characterizes the bug, not its reachability.
+- This is the **3.78** kernel, not the 3.75 target (U3 still open — the target image is not in hand).
+- **Piste 2's real gate is unchanged and is hardware.** An OTA/vmlinux contains the signed kernel +
+  SquashFS rootfs; it does **not** contain the `cache` (mtd8) YAFFS2 partition, the NAND ECC/OOB
+  layout, or runtime heap addresses. Those come only from a physical NAND dump (NandBug interposer).
+  No amount of container-based firmware analysis substitutes for that dump or for building the
+  interposer. Weaponization (poisoned cache image, heap spray, fn-ptr overwrite target) is deferred
+  and hardware-gated — not attempted here.
+
+---
+
+## Q&A pass (2026-11-14): Marvell key / backend repoint / vuln census / fake-OTA feasibility
+
+Four direct questions, answered from the 3.78.540761 OTA. Every claim traces to a finding
+above. The governing caveat (firmware-summary §0) still holds: **all of this is measured on
+3.78; the target's 3.75.468362 is unmeasured.**
+
+### QA. How secure is the Marvell (secure-boot) key?
+
+**Strong as a cryptographic anchor — it is not the soft spot.** (F26, F25)
+- Root of trust is the **SoC-fused RKEK in OTP** (`RKEK CRC`), with indexed RSA public keys
+  loaded into on-chip DTCM (`RSA KEY INDEX:%1X`, `Load No.%d RSA Public Key into User Key
+  DTCM Area`) and a **Customer Key Store** (`/bin/flash_custk`) that is *itself* anchored to
+  the fused RKEK. You **cannot swap your own public key without the Marvell root key.**
+- Chain: BootROM(fused RKEK) → prebootloader (**signed + encrypted**, entropy ~8.0) → TZ
+  (**signed + encrypted**, carries IV) → post-bootloader **RSA-verifies the kernel** → rootfs
+  **dm-verity**. No software weakness observed in the crypto path itself.
+- **Two honest asterisks, neither a break:** (1) kernel integrity is **SHA1**+RSA (`bootimg
+  SHA1 verify fail`) — SHA1 is deprecated, but you still have to forge inside RSA, so it is a
+  smell, not a hole. (2) Whether a **fused anti-rollback counter** is enforced is **open**
+  (F25/Piste 12) — if absent, an *old Google-signed* vulnerable kernel could be NAND-written
+  to revive Piste 2. That is a weakness in *rollback policy*, not in the key.
+- **Bottom line:** the key/anchor is effectively unbreakable without Marvell's/Google's
+  private key. The realistic no-key routes bypass it, not beat it: pre-verification **parser
+  bugs** in post-bootloader/USB-boot (F27) and the **writable non-verified partitions**
+  (`cache` mtd8 YAFFS2, F22/F38) — both **hardware-gated** (NAND/USB access, U5/U6).
+
+### QB. Can we replace the backend domains with our own, permanently?
+
+**Not permanently without breaking secure boot. Three routes, ranked:** (F32, F36, F19)
+1. **Edit the config on disk** (`internal.s3_grpc_server_uri` in
+   `/system/chrome/assistant_bootup_config.json`; built-ins
+   `assistant-streaming-s3-pa.googleapis.com:443`, `embeddedassistant.googleapis.com:443`,
+   autopush sandbox). **Blocked:** the file is on the **dm-verity** rootfs — no edit without
+   the signing key. `s3_grpc_server_uri` is **not** in the runtime `SetConfigString` override
+   list (F32 addendum), so a runtime repoint of an unmodified engine is **unproven, probably
+   fixed by the on-disk JSON.**
+2. **Network repoint (DNS + cert), the only route that works today** (F36/F19): the device
+   trusts **128 public CAs with no effective pinning**, so DNS/ARP/upstream redirect + any
+   publicly-trusted (or mis-issued) cert MITMs `*.googleapis.com` and lets you stand up your
+   own backend — **empirically done in F19/R1.** But it is **not permanent in the device**:
+   it needs **continuous control of the Mini's network** (DNS/egress), and the stream is
+   gated by the **undocumented S3 schema + the device's own OAuth tokens**; `lycraservice-pa`
+   uses device **mTLS** and resists.
+3. **On-device seam replacement (the clean "own backend")** (F30/F21): replace the
+   `assistant` process and serve `assistant.api.*` + the two UDS audio sockets locally to an
+   unmodified `cast_shell`. **Needs code-exec as uid `chrome` at runtime and does NOT persist
+   across reboots** (launch is in `init.rc`, dm-verity blocks rootfs edits).
+- **Net:** a *permanent, firmware-level* backend swap requires defeating secure boot
+  (NAND/hardware). What is achievable now is a **non-persistent network MITM** that you must
+  keep standing, or a non-persistent on-device takeover that needs a code-exec bug first.
+
+### QC. Vulnerability census (from the OTA software)
+
+Ordered by remote reachability. All on 3.78; per-CVE applicability pending where noted.
+- **F36 — No cert pinning / 128-CA trust (strongest remote).** On-path attacker with any
+  trusted cert MITMs the Assistant/S3 + update channels and can inject client-ops
+  (`tts.OUTPUT`, `device.UPDATE_VOLUME`, `bluetooth.*`, `device.MODIFY_SETTING`) = **remote
+  command without root.** Empirically MITM'd. Blockers: S3 schema + device OAuth tokens.
+- **F37 — Root LAN/RF daemons, version-verified, all run as root:** `dnsmasq 2.78` (< 2.83 →
+  **DNSpooq** CVE-2020-25681..687 class), `wpa_supplicant`/`hostapd` **2.6-devel**, `dhcpcd
+  6.8.2`. wpa_supplicant parses mgmt/EAPOL from any joined AP (rogue AP after deauth reaches a
+  root parser). **Caveat:** exact CVE survival depends on Google's `-3.78` backports — not yet
+  cross-checked.
+- **F33 — Cast Chrome/V8 frozen at M92 branch base (2021-05-19):** inside the
+  **CVE-2021-30563** window, lacks all later V8/Chrome fixes. **Plausible by provenance, not
+  proven** (needs patch-diff or live PoC).
+- **F35 — Renderer is sandboxed** (seccomp-bpf, no `--no-sandbox`), so a V8 RCE lands
+  **confined as uid `chrome`**; **but SELinux is OFF** (`ro.build.have_selinux=false`), so
+  post-escape lateral movement is wide. Takeover needs a 2nd-stage sandbox/kernel bug.
+- **F34 — "Unauth Cast LAUNCH runs arbitrary JS" (README Chain A): likely gated** by an
+  app-support allowlist (`ALLOWLISTED_BY_POLICY`, `aogh_url_whitelist_*`). **Unverified** —
+  needs the LAUNCH-handler decompile + live test.
+- **F27 — Post-bootloader USB-boot parser surface:** hand-rolled USB descriptor + mkbootimg
+  header parsers run **before/around** signature verification — the classic bootloader-overflow
+  class, the **most promising no-key route to our own kernel.** Hardware-gated on whether
+  micro-USB D+/D- are routed (U6).
+- **F22/F38 — YAFFS2 object-confusion (Piste 2): PATCHED in the 3.78 kernel.** The
+  scan path still *exists and is vulnerable-shaped*, but the fixed mismatch branch is present.
+  Dead against 3.78. **Open for the 3.75 target** (older kernel, unmeasured).
+- **Anti-rollback counter (F25): open** — if unenforced, enables a signed-downgrade revival of
+  Piste 2.
+- **Big caveat:** every version-specific item is 3.78's; the 3.75 target is unmeasured (U3).
+
+### QD. How tricky is a fake OTA that matches the signing?
+
+**Not "tricky" — effectively impossible by forgery; it is a key-possession problem, not a
+difficulty problem.** (F28, F20, F26)
+- The OTA is an **Android recovery-style signed zip** (SignApk; `otacert` `O=Chromecast`,
+  valid 2017–2037), and `chrome/update_engine` verifies it with **RSA-PSS + SHA-256**, plus
+  `targetversionprefix` anti-downgrade. **No weakness observed.** Forging the zip signature
+  needs the **Chromecast OTA private key.**
+- **Defense in depth makes a forged wrapper pointless anyway:** every image *inside* the zip
+  (`bootloader`/`tz_en`/`post-bootloader`/`boot.img`) is **independently signed** by the
+  **Marvell-anchored chain** and **re-verified at next boot**; the rootfs is **dm-verity**. So
+  even a zip that somehow flashed would **fail to boot** without the chain keys too.
+- The `updater-script` also enforces an anti-downgrade `assert` on `ro.build.date.utc`
+  (software-only; bypassed only by a raw NAND write, which needs hardware).
+- **The only realistic "accepted fake OTA" is a logic/parser bug in `update_engine` or the
+  recovery `updater-script` — none observed.** Note the download is *public/unauthenticated/
+  not device-bound* (F20), but that is **download, not forge** — it buys you nothing toward a
+  signature.
+- **Bottom line:** without the signing key, a fake OTA is a non-starter; the attack surface
+  that matters is *not* the OTA signature but the pre-verification parsers (QD→F27) and the
+  non-verified partitions (QA→F22).
+
+### F39. The YAFFS2 object-type-confusion premise behind Piste 2 does NOT hold in the 3.78 kernel
+
+Continuation of F38 (Ghidra 12.2 headless in the same podman image, firmware read-only). Decompiled
+the full scan→insert→retype path from `work/vmlinux-3.78.elf`. Evidence:
+`evidence/20261114-yaffs-decomp.c` (scan_backwards, find_or_create, put_chunk_in_file, find_by_number,
+create_obj) and `evidence/20261114-yaffs-retype.c` (retype_obj, new_obj, oh_to_size).
+
+**Struct fact nailed down:** `yaffs_obj.variant_type` is at **offset 100 (0x64)** — proven by
+`yaffs_create_obj` (`*(obj+100)=type`) and `yaffs_new_obj` (`*(obj+100)=param_3`); the variant union
+is at **offset 0x68** (size 0x20). Values: 1=FILE, 2=SYMLINK, 3=DIR, 4=HARDLINK.
+
+**Every type-specific access is guarded; the confusion write is unreachable:**
+- Data-chunk path (`chunk_id!=0`), scan C lines ~253–300: after `yaffs_find_or_create_by_number`
+  (which returns an existing object of *any* type), it checks `*(obj+100)==1` (FILE). If not FILE the
+  chunk is **deleted** (`yaffs_chunk_del`), never inserted. `yaffs_put_chunk_in_file` itself re-checks
+  `*(obj+100)!=1` and either BUG()s (not-in-scan) or deletes the chunk (in-scan) — the tnode-tree write
+  into `obj+0x68` happens **only** for a FILE object. Double-guarded.
+- Header-chunk path, scan C line ~405: `if (*(obj+100) != expected_type)` → `yaffs_retype_obj(obj,
+  expected)`. `yaffs_retype_obj` switch-frees the *old* variant, then **`__memzero(obj+0x68, 0x20)`**
+  the whole union before setting the new `variant_type`. No stale-union carryover.
+
+**Conclusion:** the specific primitive Piste 2 / F7 is built on — "a crafted chunk with the same
+`obj_id` but mismatched type causes a file-size field to alias a `children.next` pointer" — is **not
+present** in this build. The 2014-era hardening (or equivalent) is in place.
+
+**Limits (do not overstate the reverse, either):**
+- This is the **3.78.540761** kernel (second Mini), **not the 3.75.468362 target** (U3 still open). A
+  guard could in principle have been backported between them, but the notes' claim that "all known
+  builds ≤ 2021 never received the patch" (F7/Piste 2) is now directly contradicted by a shipping
+  binary — so that premise was either wrong or the fix long predates this build. **This needs the
+  target's own image to settle for *our* unit.**
+- I validated only this one scan/insert/retype confusion — the exact bug the notes describe. This does
+  **not** prove yaffs2 is free of *other* bugs, only that this primitive is guarded.
+- I did not independently confirm courk's *actual* published vulnerability; the characterization tested
+  here is the one recorded in our own notes, which may have mischaracterized it.
+
+**Impact on Piste 2:** the software-side premise is undercut on current firmware. Before any investment
+in NandBug hardware, the bug must be re-grounded against (a) courk's real writeup and (b) the 3.75
+target image. Per the notes' own rule ("Track B's first deliverable is a decision, not code"), this is
+a stop-and-reassess point, not a green light.

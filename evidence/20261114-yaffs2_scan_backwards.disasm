@@ -1,0 +1,38 @@
+EXCERPT — arm-linux-gnueabi-objdump output over Google's copyrighted kernel binary
+(work/vmlinux-3.78.elf). Trimmed to the instruction windows F38 cites; the full
+yaffs2_scan_backwards disassembly (0xc0293bcc–0xc0294bfc) is NOT checked in.
+Regenerate from your own OTA per evidence/README-yaffs-decompiles.md.
+
+c0293bcc <yaffs2_scan_backwards>:
+
+--- (1) type-mismatch guard -> yaffs_retype_obj (the 2014 upstream fix shape) ---
+c02942ac:	e51b30a4 	ldr	r3, [fp, #-164]	@ expected type (from obj header, or local_44)
+c02942b0:	e51b0088 	ldr	r0, [fp, #-136]	@ the object named by obj_id
+c02942b4:	e3530000 	cmp	r3, #0
+c02942bc:	15931000 	ldrne	r1, [r3]
+c02942c0:	051b1040 	ldreq	r1, [fp, #-64]
+c02942c4:	ebffe3ad 	bl	c028d180 <yaffs_retype_obj>
+c02942cc:	e5d03000 	ldrb	r3, [r0]
+c02942d4:	e3130080 	tst	r3, #128	@ 0x80
+c02942d8:	1a000056 	bne	c0294438 <yaffs2_scan_backwards+0x86c>
+
+--- (2) data-chunk path @ 0xc029436c: r2=#3 (YAFFS_OBJECT_TYPE_FILE) hardcoded,
+        returned object consumed immediately via yaffs_oh_to_size ---
+c0294360:	e5951004 	ldr	r1, [r5, #4]	@ obj_id
+c0294364:	e3a02003 	mov	r2, #3		@ YAFFS_OBJECT_TYPE_FILE  (hardcoded)
+c0294368:	e1a0000a 	mov	r0, sl
+c029436c:	e50b50a4 	str	r5, [fp, #-164]
+c0294370:	ebffd4ec 	bl	c0289728 <yaffs_find_or_create_by_number>
+c0294374:	e1a05000 	mov	r5, r0
+c0294378:	e51b00a4 	ldr	r0, [fp, #-164]
+c029437c:	ebffe9a0 	bl	c028ea04 <yaffs_oh_to_size>
+
+--- (3) site 0xc0294558: the [obj,#100] / cmp #1 type check noted as open in F38 ---
+c0294544:	e2503000 	subs	r3, r0, #0
+c0294550:	0a000042 	beq	c0294660 <yaffs2_scan_backwards+0xa94>
+c0294554:	e51b2088 	ldr	r2, [fp, #-136]
+c0294558:	e5922064 	ldr	r2, [r2, #100]	@ 0x64  obj->variant_type
+c029455c:	e3520001 	cmp	r2, #1		@ == YAFFS_OBJECT_TYPE_FILE ?
+c0294560:	1a00000c 	bne	c0294598 <yaffs2_scan_backwards+0x9cc>
+
+(remaining instructions of yaffs2_scan_backwards elided)
